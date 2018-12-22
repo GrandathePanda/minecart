@@ -26,7 +26,11 @@ import sys
 
 import six
 
+from pdfminer.pdftypes import PDFObjRef
+from pdfminer.psparser import PSLiteral
 from pdfminer.psparser import LIT
+from . import color
+
 JPEG_FILTERS = (LIT('DCTDecode'), LIT('DCT'), LIT('JPXDecode'))
 
 
@@ -260,6 +264,7 @@ class Image(GraphicsObject):
 
         """
         import PIL.Image
+        import PIL.ImageCms
         try:
             image_data = self.obj.get_data()
         except pdfminer.pdftypes.PDFNotImplementedError:
@@ -271,12 +276,27 @@ class Image(GraphicsObject):
                 return PIL.Image.open(image_data)
             raise  # We either can't handle the predictor or the filter
 
+        icc_profile = None
+
         lti = pdfminer.layout.LTImage("", self.obj, self.get_bbox())
         # The PDF spec allows non-JPEG images to have 1, 2, 4, 8 or 16 bits
         if isinstance(lti.colorspace, list):
-            colorspace = str(lti.colorspace[0])[1:]  # strip leading /
+            assert len(lti.colorspace) == 1
+            cs_inst = lti.colorspace[0]
+
+
+        if isinstance(cs_inst, PDFObjRef):
+            colorspace = "PDFObjRef"
+        elif isinstance(cs_inst, PSLiteral):
+            colorspace = cs_inst.name
         else:
-            colorspace = str(lti.colorspace)[1:]  # strip leading /
+
+            # import pdb
+            # pdb.set_trace()
+
+            raise pdfminer.pdftypes.PDFNotImplementedError(
+                "Colorspace type (%s) support not implemented?" % (type(cs_inst), ))
+
         if colorspace in ('DeviceRGB', 'CalRGB', 'RGB'):
             mode = "RGB"
             samples = 3
@@ -349,10 +369,58 @@ class Image(GraphicsObject):
                 rawmode = "L"
             elif lti.bits == 16:
                 rawmode = "L;16"
+
+        # Embedded color profile
+        elif 'PDFObjRef' in colorspace:
+            resolved = cs_inst.resolve()
+
+            # Note: The colorspace flag is a pdfminer.psparser.PSLiteral, but it's
+            # __repr__ returns a string. Confusing as fuck. Anyways, apparently
+            # the actual value is without a leading /, so when we access it
+            # via .name, that's removed. Sigh.
+            cspace_mode = resolved[0].name
+
+            if cspace_mode == 'ICCBased':
+                assert len(resolved) == 2, "ICCBased color space profiles should have only one entry. What?"
+                cs_data = resolved[1].resolve()
+                icc_profile = cs_data.get_data()
+
+            elif cspace_mode == "Indexed":
+
+                resd = []
+                for tmp in resolved[1:]:
+
+                    if isinstance(tmp, PDFObjRef):
+                        resd.append(tmp.resolve())
+                    elif isinstance(tmp, PSLiteral):
+                        resd.append(tmp.name)
+                    else:
+                        resd.append(tmp)
+
+                # Base color map,
+                # hval (maximum index in the colorspace),
+                #  lookup table in colorspace `base` for each value in 0 -> hval
+                base, hval, lookup = resd
+                if hval == 0:
+                    # Return nothing, since there are no colors anyways.
+                    return None
+                else:
+
+                    raise pdfminer.pdftypes.PDFNotImplementedError(
+                        "Interpreting non-empty indexed colorspaces not implemented yet!")
+
+            else:
+
+                raise pdfminer.pdftypes.PDFNotImplementedError(
+                    "Non ICC colorspace embedded images not implemented. Colorspace type: %s"
+                        % (cspace_mode, ))
+
+
         elif colorspace in ('DeviceCMYK', 'CMYK'):
             if lti.bits != 8:
                 raise pdfminer.pdftypes.PDFNotImplementedError(
                     "PIL only supports 8-bit CMYK")
+
             # TODO: Upcast the 1/2/4 bit image to 8 bits.
             # Can PIL handle 16-bit CMYK?
             mode = "CMYK"
@@ -364,8 +432,18 @@ class Image(GraphicsObject):
         # The PDF spec requires each row of data to be 0-padded to be at a
         # byte boundary. stride is the distance in bytes between consecutive
         # rows of image data.
-        stride = (lti.srcsize[0] * lti.bits * samples + 7) // 8
+        # stride = (lti.srcsize[0] * lti.bits * samples + 7) // 8
         image = PIL.Image.open(io.BytesIO(image_data))
+
+        # If we have a ICC profile decode it and apply it to the image.
+        # Return type is always sRGB because lazy.
+        if icc_profile:
+            in_profile = io.BytesIO(icc_profile)
+            prof = PIL.ImageCms.ImageCmsProfile(in_profile)
+            srgb = PIL.ImageCms.createProfile('sRGB')
+
+            image = PIL.ImageCms.profileToProfile(image, prof, srgb)
+
 
         return image
         # TODO: implement Decode array

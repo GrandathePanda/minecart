@@ -24,7 +24,7 @@ setup(
         'License :: OSI Approved :: MIT License',
     ],
     keywords='pdf pdfminer extract mining images',
-    install_requires=['pdfminer3k', 'six'],
+    install_requires=['pdfminer.six', 'six'],
     extras_require={
         'PIL': ['Pillow'],
     },

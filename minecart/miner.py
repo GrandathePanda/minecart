@@ -8,6 +8,8 @@ import pdfminer.layout
 import pdfminer.pdfdevice
 import pdfminer.pdfinterp
 import pdfminer.pdfparser
+import pdfminer.pdfpage
+import pdfminer.pdfdocument
 import pdfminer.pdftypes
 import pdfminer.utils
 import pdfminer.pdfcolor
@@ -255,20 +257,20 @@ class DeviceLoader(pdfminer.pdfdevice.PDFTextDevice):
     def render_string_vertical(self, *args):
         return self.render_string_hv('vertical', *args)
 
-    def render_char(self, matrix, font, fontsize, scaling, rise, cid):
+    def render_char(self, matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate):
         # Essentials copied from
         # pdfminer.converter.PDFLayoutAnalyzer.render_char
         text = font.to_unichr(cid)
         textwidth = font.char_width(cid)
         textdisp = font.char_disp(cid)
         item = pdfminer.layout.LTChar(matrix, font, fontsize, scaling, rise,
-                                      text, textwidth, textdisp)
+                                      text, textwidth, textdisp, ncs, graphicstate)
         self.str_container.add(item)
         return item.adv
 
     def render_string_hv(self, hv, seq, matrix, vec, font, fontsize,
                          scaling, charspace, wordspace, rise,
-                         dxscale):
+                         dxscale, ncs, graphicstate):
         """
         Calculate the bounding box in user coordinates for a string.
 
@@ -305,7 +307,7 @@ class DeviceLoader(pdfminer.pdfdevice.PDFTextDevice):
                         vec[hv] += charspace
                     vec[hv] += self.render_char(
                         pdfminer.utils.translate_matrix(matrix, vec),
-                        font, fontsize, scaling, rise, cid)
+                        font, fontsize, scaling, rise, cid, ncs, graphicstate)
                     if cid == 32 and wordspace:
                         vec[hv] += wordspace
                     needcharspace = True
@@ -327,13 +329,12 @@ class Document(object):
         self.device = DeviceLoader(res_mgr)
         self.interpreter = ColoredInterpreter(res_mgr, self.device)
         self.parser = pdfminer.pdfparser.PDFParser(pdffile)
-        self.doc = pdfminer.pdfparser.PDFDocument(caching=True)
+        self.doc = pdfminer.pdfdocument.PDFDocument(parser=self.parser, caching=True)
         self.parser.set_document(self.doc)
-        self.doc.set_parser(self.parser)
 
     def iter_pages(self):
         "Iterate through all the pages in a document."
-        for page in self.doc.get_pages():
+        for page in pdfminer.pdfpage.PDFPage.create_pages(self.doc):
             self.interpreter.process_page(page)
             yield self.device.page
 
@@ -345,7 +346,7 @@ class Document(object):
         display order, not the numbering system used in the document.
 
         """
-        for i, page in enumerate(self.doc.get_pages()):
+        for i, page in enumerate(pdfminer.pdfpage.PDFPage.create_pages(self.doc)):
             if i == num:
                 self.interpreter.process_page(page)
                 return self.device.page
