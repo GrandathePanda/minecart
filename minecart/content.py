@@ -256,46 +256,78 @@ class Image(GraphicsObject):
     def get_bbox(self):
         return self.bbox
 
-    def as_pil(self):
-        """
-        Return the image data in a `PIL.Image` object.
-
-        Requires `pillow` to be installed.
-
-        """
+    def _decode_dct(self, lti, cspace, image_data):
+        '''
+        For an image that's an embedded JPEG (e.g. packed with the `DCTDecode` filter),
+        extract the associated colorspace (if any), apply it, open the image stream as a
+        buffer, and return an associated PIL image.
+        '''
         import PIL.Image
         import PIL.ImageCms
-        try:
-            image_data = self.obj.get_data()
-        except pdfminer.pdftypes.PDFNotImplementedError:
-            filters = self.obj.get_filters()
-            if len(filters) == 1 and filters[0] in JPEG_FILTERS:
-                # FIXME: ColorSpace in JPEG2000 should be overridden by the
-                # ColorSpace in the Image dictionary
-                image_data = io.BytesIO(self.obj.rawdata)
-                return PIL.Image.open(image_data)
-            raise  # We either can't handle the predictor or the filter
 
         icc_profile = None
 
-        lti = pdfminer.layout.LTImage("", self.obj, self.get_bbox())
-        # The PDF spec allows non-JPEG images to have 1, 2, 4, 8 or 16 bits
-        if isinstance(lti.colorspace, list):
-            assert len(lti.colorspace) == 1
-            cs_inst = lti.colorspace[0]
+        # Embedded color profile.
+        # JPEG has it's own embedded colorspace otherwise.
+        if isinstance(cspace, PDFObjRef):
+            resolved = cspace.resolve()
 
+            # Note: The colorspace flag is a pdfminer.psparser.PSLiteral, but it's
+            # __repr__ returns a string. Confusing as fuck. Anyways, apparently
+            # the actual value is without a leading /, so when we access it
+            # via .name, that's removed. Sigh.
+            cspace_mode = resolved[0].name
 
-        if isinstance(cs_inst, PDFObjRef):
-            colorspace = "PDFObjRef"
-        elif isinstance(cs_inst, PSLiteral):
-            colorspace = cs_inst.name
-        else:
+            if cspace_mode == 'ICCBased':
+                assert len(resolved) == 2, "ICCBased color space profiles should have only one entry. What?"
+                cs_data = resolved[1].resolve()
+                icc_profile = cs_data.get_data()
 
-            # import pdb
-            # pdb.set_trace()
+            elif cspace_mode == "Indexed":
 
-            raise pdfminer.pdftypes.PDFNotImplementedError(
-                "Colorspace type (%s) support not implemented?" % (type(cs_inst), ))
+                resd = []
+                for tmp in resolved[1:]:
+
+                    if isinstance(tmp, PDFObjRef):
+                        resd.append(tmp.resolve())
+                    elif isinstance(tmp, PSLiteral):
+                        resd.append(tmp.name)
+                    else:
+                        resd.append(tmp)
+
+                # Base color map,
+                # hval (maximum index in the colorspace),
+                #  lookup table in colorspace `base` for each value in 0 -> hval
+                base, hval, lookup = resd
+                if hval == 0:
+                    # Return nothing, since there are no colors anyways.
+                    return None
+                else:
+
+                    raise pdfminer.pdftypes.PDFNotImplementedError(
+                        "Interpreting non-empty indexed colorspaces not implemented yet!")
+
+        image = PIL.Image.open(io.BytesIO(image_data))
+
+        # If we have a ICC profile decode it and apply it to the image.
+        # Return type is always sRGB because lazy.
+        if icc_profile:
+            in_profile = io.BytesIO(icc_profile)
+            prof = PIL.ImageCms.ImageCmsProfile(in_profile)
+            srgb = PIL.ImageCms.createProfile('sRGB')
+
+            image = PIL.ImageCms.profileToProfile(image, prof, srgb)
+
+        return image
+
+    def _decode_ppm(self, lti, colorspace, image_data):
+        '''
+        Given a embedded bitmap image, decode it as well as we can.
+        '''
+        import PIL.Image
+        import PIL.ImageCms
+
+        icc_profile = None
 
         if colorspace in ('DeviceRGB', 'CalRGB', 'RGB'):
             mode = "RGB"
@@ -356,6 +388,7 @@ class Image(GraphicsObject):
             else:
                 raise pdfminer.pdftypes.PDFNotImplementedError(
                     "RGB images with %d-bit samples are not supported" % lti.bits)
+
         elif colorspace in ('CalGray', 'DeviceGray'):
             mode = 'L'
             samples = 1
@@ -370,50 +403,11 @@ class Image(GraphicsObject):
             elif lti.bits == 16:
                 rawmode = "L;16"
 
-        # Embedded color profile
-        elif 'PDFObjRef' in colorspace:
-            resolved = cs_inst.resolve()
-
-            # Note: The colorspace flag is a pdfminer.psparser.PSLiteral, but it's
-            # __repr__ returns a string. Confusing as fuck. Anyways, apparently
-            # the actual value is without a leading /, so when we access it
-            # via .name, that's removed. Sigh.
-            cspace_mode = resolved[0].name
-
-            if cspace_mode == 'ICCBased':
-                assert len(resolved) == 2, "ICCBased color space profiles should have only one entry. What?"
-                cs_data = resolved[1].resolve()
-                icc_profile = cs_data.get_data()
-
-            elif cspace_mode == "Indexed":
-
-                resd = []
-                for tmp in resolved[1:]:
-
-                    if isinstance(tmp, PDFObjRef):
-                        resd.append(tmp.resolve())
-                    elif isinstance(tmp, PSLiteral):
-                        resd.append(tmp.name)
-                    else:
-                        resd.append(tmp)
-
-                # Base color map,
-                # hval (maximum index in the colorspace),
-                #  lookup table in colorspace `base` for each value in 0 -> hval
-                base, hval, lookup = resd
-                if hval == 0:
-                    # Return nothing, since there are no colors anyways.
-                    return None
-                else:
-
-                    raise pdfminer.pdftypes.PDFNotImplementedError(
-                        "Interpreting non-empty indexed colorspaces not implemented yet!")
-
             else:
 
                 raise pdfminer.pdftypes.PDFNotImplementedError(
                     "Non ICC colorspace embedded images not implemented. Colorspace type: %s"
-                        % (cspace_mode, ))
+                        % (colorspace, ))
 
 
         elif colorspace in ('DeviceCMYK', 'CMYK'):
@@ -433,7 +427,21 @@ class Image(GraphicsObject):
         # byte boundary. stride is the distance in bytes between consecutive
         # rows of image data.
         # stride = (lti.srcsize[0] * lti.bits * samples + 7) // 8
-        image = PIL.Image.open(io.BytesIO(image_data))
+
+
+        if lti.filter == 'FlateDecode':
+            pass
+        else:
+            raise pdfminer.pdftypes.PDFNotImplementedError(
+                "Colorspace %r is not supported" % colorspace)
+
+        # if im_typ == 'data':
+        #     import pdb
+        #     pdb.set_trace()
+
+        # image = PIL.Image.frombuffer(mode=mode, size=lti.size, data=image_data, decoder_name="raw")
+        image = PIL.Image.frombuffer(mode, lti.size, image_data, 'raw', mode, 0, -1)
+        image = image.transpose(PIL.Image.FLIP_TOP_BOTTOM)
 
         # If we have a ICC profile decode it and apply it to the image.
         # Return type is always sRGB because lazy.
@@ -448,6 +456,60 @@ class Image(GraphicsObject):
         return image
         # TODO: implement Decode array
         # TODO: implement image mask
+
+
+    def as_pil(self):
+        """
+        Return the image data in a `PIL.Image` object.
+
+        Requires `pillow` to be installed.
+
+        """
+        import PIL.Image
+        import PIL.ImageCms
+        try:
+            image_data = self.obj.get_data()
+        except pdfminer.pdftypes.PDFNotImplementedError:
+            filters = self.obj.get_filters()
+            if len(filters) == 1 and filters[0] in JPEG_FILTERS:
+                # FIXME: ColorSpace in JPEG2000 should be overridden by the
+                # ColorSpace in the Image dictionary
+                image_data = io.BytesIO(self.obj.rawdata)
+                return PIL.Image.open(image_data)
+            raise  # We either can't handle the predictor or the filter
+
+
+        lti = pdfminer.layout.LTImage("", self.obj, self.get_bbox())
+        # The PDF spec allows non-JPEG images to have 1, 2, 4, 8 or 16 bits
+        if isinstance(lti.colorspace, list):
+            assert len(lti.colorspace) == 1
+            cs_inst = lti.colorspace[0]
+        else:
+            cs_inst = lti.colorspace
+
+
+        # DCTDecode is a plain old jpeg.
+        if lti.filter == 'DCTDecode' or lti.filter == 'JPXDecode':
+            return self._decode_dct(lti, cs_inst, image_data)
+
+        # FlateDecode seems to be the filter of choice on bitmaps.
+        elif lti.filter == 'FlateDecode' or lti.filter == 'LZWDecode' or lti.filter == 'RunLengthDecode':
+
+            if isinstance(cs_inst, PDFObjRef):
+                raise pdfminer.pdftypes.PDFNotImplementedError(
+                    "Bitmap images with embedded colorspaces not supported at the moment.")
+
+
+            assert isinstance(cs_inst, PSLiteral)
+            colorspace = cs_inst.name
+
+            return self._decode_ppm(lti, colorspace, image_data)
+            return self._decode_dct(lti, cs_inst, image_data)
+
+        else:
+            raise pdfminer.pdftypes.PDFNotImplementedError(
+                "Embedded image compressed with %s filter not supported!." % lti.filter)
+
 
 
 class Lettering(six.text_type, GraphicsObject):
